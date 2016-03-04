@@ -20,31 +20,54 @@ trait Linker {
 
 object Linker {
 
-  def parse(config: String, configInitializers: Seq[ConfigInitializer]): LinkerConfig = {
-    val mapper = Parser.objectMapper(config)
-    // Subtypes must not conflict
-    configInitializers.groupBy(_.configId).collect {
-      case (id, cis) if cis.size > 1 =>
-        throw ConflictingSubtypes(cis(0).namedType, cis(1).namedType)
+  private def ensureUniqueKinds(inits: Seq[ConfigInitializer]): Unit =
+    inits.groupBy(_.configId).foreach {
+      case (_, Seq(a, b, _*)) => throw ConflictingSubtypes(a.namedType, b.namedType)
+      case _ =>
     }
-    for (ci <- configInitializers) ci.registerSubtypes(mapper)
-    // TODO: Store the LinkerConfig so that it can be serialized out later
+
+  private[linkerd] case class Initializers(
+    protocol: Seq[ProtocolInitializer] = Nil,
+    namer: Seq[NamerInitializer] = Nil,
+    interpreter: Seq[InterpreterInitializer] = Nil,
+    tlsClient: Seq[TlsClientInitializer] = Nil,
+    tracer: Seq[TracerInitializer] = Nil
+  ) {
+    def iter: Iterable[Seq[ConfigInitializer]] =
+      Seq(protocol, namer, interpreter, tlsClient, tracer)
+
+    def parse(config: String): LinkerConfig =
+      Linker.parse(config, this)
+
+    def load(config: String): Linker =
+      Linker.load(config, this)
+  }
+
+  private[linkerd] lazy val LoadedInitializers = Initializers(
+    LoadService[ProtocolInitializer],
+    LoadService[NamerInitializer],
+    LoadService[InterpreterInitializer] :+ DefaultInterpreterInitializer,
+    LoadService[TlsClientInitializer],
+    LoadService[TracerInitializer]
+  )
+
+  private[linkerd] def parse(
+    config: String,
+    inits: Initializers = LoadedInitializers
+  ): LinkerConfig = {
+    val mapper = Parser.objectMapper(config)
+    for (kinds <- inits.iter) {
+      ensureUniqueKinds(kinds)
+      for (k <- kinds) k.registerSubtypes(mapper)
+    }
     mapper.readValue[LinkerConfig](config)
   }
 
-  def load(config: String, configInitializers: Seq[ConfigInitializer]): Linker =
-    parse(config, configInitializers).mk()
+  private[linkerd] def load(config: String, inits: Initializers): Linker =
+    parse(config, inits).mk()
 
-  def parse(config: String): LinkerConfig = {
-    val protocols = LoadService[ProtocolInitializer]
-    val namers = LoadService[NamerInitializer]
-    val interpreters = LoadService[InterpreterInitializer] :+ new DefaultInterpreterInitializer
-    val clientTls = LoadService[TlsClientInitializer]
-    val tracers = LoadService[TracerInitializer]
-    parse(config, protocols ++ namers ++ interpreters ++ clientTls ++ tracers)
-  }
-
-  def load(config: String): Linker = parse(config).mk()
+  def load(config: String): Linker =
+    load(config, LoadedInitializers)
 
   case class LinkerConfig(
     namers: Option[Seq[NamerConfig]],
@@ -56,8 +79,7 @@ object Linker {
       // At least one router must be specified
       if (routers.isEmpty) throw NoRoutersSpecified
 
-      val tracerImpls = tracers.map(_.map(_.newTracer()))
-      val tracer: Tracer = tracerImpls match {
+      val tracer: Tracer = tracers.map(_.map(_.newTracer())) match {
         case Some(Nil) => NullTracer
         case Some(Seq(tracer)) => tracer
         case Some(tracers) => BroadcastTracer(tracers)
@@ -70,10 +92,8 @@ object Linker {
       }
 
       // Router labels must not conflict
-      routers.groupBy(_.label).foreach {
-        case (label, rts) =>
-          if (rts.size > 1) throw ConflictingLabels(label)
-      }
+      for ((label, rts) <- routers.groupBy(_.label))
+        if (rts.size > 1) throw ConflictingLabels(label)
 
       val routerParams = namerParams + Router.Namers(namersByPrefix)
       val routerImpls = routers.map { router =>
@@ -82,10 +102,11 @@ object Linker {
       }
 
       // Server sockets must not conflict
-      routerImpls.flatMap(_.servers).groupBy(_.addr).foreach {
-        case (port, svrs) =>
-          if (svrs.size > 1) throw ConflictingPorts(svrs(0).addr, svrs(1).addr)
-      }
+      for (srvs <- routerImpls.flatMap(_.servers).groupBy(_.addr).values)
+        srvs match {
+          case Seq(srv0, srv1, _*) => throw ConflictingPorts(srv0.addr, srv1.addr)
+          case _ =>
+        }
 
       new Impl(routerImpls, namersByPrefix, tracer, admin.getOrElse(Admin()))
     }
