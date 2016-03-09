@@ -133,7 +133,9 @@ Each router must be configured as an object with the following params:
 * *timeoutMs* -- Per-request timeout in milliseconds. (default: no  timeout)
 * *interpreter* -- an interpreter type name, determining what module
   will be used to process destinations.  Currently only the _default_
-  interpreter is supported.
+  interpreter is supported; this interpreter resolves names via the configured
+  [`namers`](#naming), with a fallback to the default Finagle `Namer.Global`
+  that handles paths of the form `/$/`.
 
 <!-- TODO router capacity  -->
 
@@ -315,6 +317,7 @@ routers:
     /overNineThousand => /$/inet/127.0.1/9001;
 ```
 
+<a name="naming"></a>
 ## Service discovery and naming
 
 linkerd supports a variety of common service discovery backends, including
