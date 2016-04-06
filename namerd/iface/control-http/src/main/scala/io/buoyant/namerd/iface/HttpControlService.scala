@@ -6,11 +6,13 @@ import com.fasterxml.jackson.databind.module.SimpleModule
 import com.fasterxml.jackson.module.scala.DefaultScalaModule
 import com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper
 import com.twitter.finagle.http._
-import com.twitter.finagle.{Dentry, Dtab, NameTree, Path, Service}
-import com.twitter.io.Buf
+import com.twitter.finagle.{Status => _, _}
+import com.twitter.finagle.naming.NameInterpreter
+import com.twitter.io.{Writer, Buf}
 import com.twitter.util._
+import io.buoyant.linkerd.admin.names.{Delegator, DelegateApiHandler}
 import io.buoyant.namerd.DtabStore.{DtabVersionMismatchException, DtabNamespaceDoesNotExistException}
-import io.buoyant.namerd.{DtabStore, VersionedDtab}
+import io.buoyant.namerd.{VersionedDtab, DtabStore, Ns}
 
 object HttpControlService {
 
@@ -106,6 +108,29 @@ object HttpControlService {
       }
   }
 
+  trait NsPathUri {
+    val prefix: String
+
+    def unapply(path: String): Option[(Ns, Path)] = {
+      if (!path.startsWith(prefix)) return None
+      val segments = path.stripPrefix(prefix).split("/")
+      if (segments.size < 2) return None
+      Some((segments.head, Path.Utf8(segments.drop(1): _*)))
+    }
+  }
+
+  object BindUri extends NsPathUri {
+    val prefix = "/api/1/bind/"
+  }
+
+  object AddrUri extends NsPathUri {
+    val prefix = "/api/1/addr/"
+  }
+
+  object DelegateUri extends NsPathUri {
+    val prefix = "/api/1/delegate/"
+  }
+
   def versionString(buf: Buf): String = {
     val versionBytes = new Array[Byte](buf.length)
     buf.write(versionBytes, 0)
@@ -113,7 +138,8 @@ object HttpControlService {
   }
 }
 
-class HttpControlService(storage: DtabStore) extends Service[Request, Response] {
+class HttpControlService(storage: DtabStore, namers: Ns => NameInterpreter)
+  extends Service[Request, Response] {
   import HttpControlService._
 
   /** Get the dtab, if it exists. */
@@ -133,6 +159,12 @@ class HttpControlService(storage: DtabStore) extends Service[Request, Response] 
       handlePostDtab(ns, req)
     case (DtabUri(Some(ns)), Method.Delete) =>
       handleDeleteDtab(ns)
+    case (BindUri(ns, path), Method.Get) =>
+      handleGetBind(ns, path)
+    case (AddrUri(ns, path), Method.Get) =>
+      handleGetAddr(ns, path)
+    case (DelegateUri(ns, path), Method.Get) =>
+      handleGetDelegate(ns, path)
     // invalid uri/method
     case _ =>
       Future.value(Response(Status.NotFound))
@@ -225,4 +257,87 @@ class HttpControlService(storage: DtabStore) extends Service[Request, Response] 
       case Throw(_: DtabNamespaceDoesNotExistException) => Future.value(Response(Status.NotFound))
       case Throw(_) => Future.value(Response(Status.InternalServerError))
     }
+
+  /*
+   * We keep a cache of observations.  Each observer keeps track of
+   * the most recently observed state, and provides a Future that will
+   * be satisfied when the next update occurs.
+   *
+   * XXX we need a mechanism to evict observers that haven't been
+   * observed in $period or at least limit the size of these caches.
+   *
+   * XXX I expect this could be more efficient, even lockless.
+   */
+
+  private[this] val bindingCacheMu = new {}
+  private[this] var bindingCache: Map[(String, Path), Activity[NameTree[Name.Bound]]] = Map.empty
+  private[this] def getBind(ns: String, path: Path): Activity[NameTree[Name.Bound]] =
+    bindingCacheMu.synchronized {
+      val key = (ns, path)
+      bindingCache.get(key) match {
+        case Some(act) => act
+        case None =>
+          val act = namers(ns).bind(Dtab.empty, path)
+          bindingCache += (key -> act)
+          act
+      }
+    }
+
+  private[this] def handleGetBind(ns: String, path: Path): Future[Response] = {
+    val act = getBind(ns, path)
+    val resp = Response()
+    resp.setChunked(true)
+    val writer = resp.writer
+    var closable: Closable = null
+    var writeFuture: Future[Unit] = Future.Unit
+    closable = act.values.respond {
+      case Return(tree) =>
+        writeFuture = writeFuture.before {
+          writer.write(Buf.Utf8(tree.show + "\n")).onFailure(_ => closable.close())
+        }
+      case Throw(e) =>
+        closable.close()
+    }
+
+    Future.value(resp)
+  }
+
+  private[this] def streamingAddr(addr: Var[Addr]): Future[Response] = {
+    val resp = Response()
+    resp.setChunked(true)
+    val sr = new StreamingResponse(resp.writer)
+    sr.start(addr) { addr =>
+      Buf.Utf8(addr.toString + "\n")
+    }
+    Future.value(resp)
+  }
+
+  private[this] def handleGetAddr(ns: String, path: Path): Future[Response] = {
+    val addr = getBind(ns, path).run.flatMap {
+      case Activity.Pending => Var.value(Addr.Pending)
+      case Activity.Failed(e) => Var.value(Addr.Failed(e))
+      case Activity.Ok(tree) => tree match {
+        case NameTree.Leaf(bound) => bound.addr
+        case NameTree.Empty => Var.value(Addr.Bound())
+        case NameTree.Fail => Var.value(Addr.Failed("name tree failed"))
+        case NameTree.Neg => Var.value(Addr.Neg)
+        case NameTree.Alt(_) | NameTree.Union(_) =>
+          Var.value(Addr.Failed(s"${path.show} is not a concrete bound id"))
+      }
+    }
+    streamingAddr(addr)
+  }
+
+  private[this] def handleGetDelegate(ns: String, path: Path): Future[Response] = {
+    getDtab(ns).flatMap {
+      case Some(dtab) =>
+        Delegator(dtab.dtab, path, namers(ns)).values.toFuture.flatMap(Future.const).map { delegateTree =>
+          val rsp = Response()
+          rsp.content = DelegateApiHandler.Codec.writeBuf(delegateTree)
+          rsp.contentType = MediaType.Json
+          rsp
+        }
+      case None => Future.value(Response(Status.NotFound))
+    }
+  }
 }
