@@ -1,5 +1,8 @@
 ## x.x.x
 
+* Add experimental support for storing dtabs in Kubernetes via the
+  ThirdPartyResource API (which must be enabled in your cluster).
+
 ## 0.3.1
 
 * Add beta version of linkerd dashboard version 2.0.  Try it out at
